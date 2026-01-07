@@ -1,5 +1,6 @@
 // server.js
 // API Chat Clickmesh (Render) - versión endurecida para producción
+//
 // Requisitos env vars en Render:
 // - OPENAI_API_KEY = tu clave de OpenAI
 // - WIDGET_TOKEN   = token largo (mín. 32-64 caracteres) para autorizar el widget
@@ -19,7 +20,7 @@ const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 
-// --- Seguridad básica HTTP ---
+// -------------------- Seguridad básica HTTP --------------------
 app.disable("x-powered-by");
 app.use(
   helmet({
@@ -28,14 +29,15 @@ app.use(
   })
 );
 
-// --- Body limit para evitar abusos ---
+// -------------------- Body limit (evitar abusos) --------------------
 app.use(express.json({ limit: "16kb" }));
 
-// --- CORS restringido ---
+// -------------------- CORS restringido --------------------
 const defaultAllowed = [
   "https://automatizacionesbilbao.es",
   "https://www.automatizacionesbilbao.es",
 ];
+
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -46,7 +48,7 @@ const finalAllowed = allowedOrigins.length ? allowedOrigins : defaultAllowed;
 app.use(
   cors({
     origin: function (origin, cb) {
-      // Permite llamadas sin Origin (Postman/cURL). Si quieres bloquearlas, quita este bloque.
+      // Permite llamadas sin Origin (Postman/cURL). Si quieres bloquearlas, cambia a: return cb(new Error("CORS: origen requerido"));
       if (!origin) return cb(null, true);
 
       if (finalAllowed.includes(origin)) return cb(null, true);
@@ -55,11 +57,18 @@ app.use(
     },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "X-Widget-Token"],
+    // credentials: false, // no usamos cookies aquí
   })
 );
-app.options("/*", cors());
 
-// --- Rate limiting (protege contra abusos y gasto) ---
+// ✅ Express 5: NO usar app.options("*") ni app.options("/*") (rompe con path-to-regexp)
+// Respuesta genérica a preflight:
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// -------------------- Rate limiting (protege contra abusos y gasto) --------------------
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minuto
   max: 20, // 20 req/min por IP
@@ -68,13 +77,13 @@ const chatLimiter = rateLimit({
 });
 app.use("/api/chat", chatLimiter);
 
-// --- Cliente OpenAI ---
+// -------------------- Cliente OpenAI --------------------
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Memoria simple en RAM (MVP). Si reinicia el servicio, se pierde (normal).
 const sessions = new Map(); // sessionId -> [{role, content}, ...]
 
-// --- Prompt del sistema ---
+// -------------------- Prompt del sistema --------------------
 function systemPrompt() {
   return `
 Eres el asistente de la web de Clickmesh (automatización y soluciones digitales).
@@ -98,10 +107,10 @@ Importante:
 `;
 }
 
-// --- Health check ---
+// -------------------- Health check --------------------
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
-// --- Middleware: autenticación simple por token del widget ---
+// -------------------- Auth simple por token del widget --------------------
 function requireWidgetToken(req, res, next) {
   const expected = process.env.WIDGET_TOKEN;
 
@@ -120,7 +129,7 @@ function requireWidgetToken(req, res, next) {
   next();
 }
 
-// --- Endpoint chat ---
+// -------------------- Endpoint chat --------------------
 app.post("/api/chat", requireWidgetToken, async (req, res) => {
   try {
     const { message, sessionId } = req.body || {};
@@ -133,14 +142,16 @@ app.post("/api/chat", requireWidgetToken, async (req, res) => {
 
     const text = String(message || "").trim();
     if (!text) {
-      return res.status(400).json({ reply: "Escribe un mensaje para poder ayudarte." });
+      return res
+        .status(400)
+        .json({ reply: "Escribe un mensaje para poder ayudarte." });
     }
 
     // Limita longitud para evitar prompts gigantes
     if (text.length > 2000) {
-      return res
-        .status(400)
-        .json({ reply: "El mensaje es demasiado largo. Resúmelo un poco, por favor." });
+      return res.status(400).json({
+        reply: "El mensaje es demasiado largo. Resúmelo un poco, por favor.",
+      });
     }
 
     const sid = sessionId || uuidv4();
@@ -166,21 +177,22 @@ app.post("/api/chat", requireWidgetToken, async (req, res) => {
       "No he podido responder ahora mismo.";
 
     // Guardar conversación en sesión
-    const newHistory = [
+    sessions.set(sid, [
       ...trimmedHistory,
       { role: "user", content: text },
       { role: "assistant", content: reply },
-    ];
-    sessions.set(sid, newHistory);
+    ]);
 
     res.json({ reply, sessionId: sid });
   } catch (e) {
     console.error("Chat error:", e);
-    res.status(500).json({ reply: "Ha ocurrido un error. Inténtalo de nuevo en unos segundos." });
+    res
+      .status(500)
+      .json({ reply: "Ha ocurrido un error. Inténtalo de nuevo en unos segundos." });
   }
 });
 
-// --- Manejo de errores CORS (más claro) ---
+// -------------------- Manejo de errores CORS (más claro) --------------------
 app.use((err, req, res, next) => {
   if (String(err?.message || "").includes("CORS")) {
     return res.status(403).json({ reply: "Origen no permitido." });
@@ -188,5 +200,6 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
+// -------------------- Arranque --------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API escuchando en http://localhost:${PORT}`));
