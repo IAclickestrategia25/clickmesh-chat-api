@@ -57,7 +57,7 @@ app.use(
     allowedHeaders: ["Content-Type", "X-Widget-Token"],
   })
 );
-app.options("*", cors());
+app.options("/*", cors());
 
 // --- Rate limiting (protege contra abusos y gasto) ---
 const chatLimiter = rateLimit({
