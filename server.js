@@ -1,13 +1,8 @@
-// server.js
-// API Chat Clickmesh (Render) - versión endurecida para producción
-//
-// Requisitos env vars en Render:
-// - OPENAI_API_KEY = tu clave de OpenAI
-// - WIDGET_TOKEN   = token largo (mín. 32-64 caracteres) para autorizar el widget
-// Opcional:
-// - ALLOWED_ORIGINS = lista separada por comas de orígenes permitidos
-//   ejemplo: https://automatizacionesbilbao.es,https://www.automatizacionesbilbao.es
-// - PORT = lo pone Render automáticamente
+// server.js — Clickmesh Chat API (Render) con bloqueo de orígenes
+// ENV en Render:
+// OPENAI_API_KEY = ...
+// WIDGET_TOKEN   = token largo
+// (opcional) ALLOWED_ORIGINS = "https://automatizacionesbilbao.es,https://www.automatizacionesbilbao.es"
 
 const express = require("express");
 const cors = require("cors");
@@ -19,71 +14,86 @@ const OpenAI = require("openai");
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
-
-// -------------------- Seguridad básica HTTP --------------------
 app.disable("x-powered-by");
+
 app.use(
   helmet({
-    // Para APIs suele ser mejor sin CSP estricta (no servimos HTML aquí)
     contentSecurityPolicy: false,
   })
 );
 
-// -------------------- Body limit (evitar abusos) --------------------
 app.use(express.json({ limit: "16kb" }));
 
-// -------------------- CORS restringido --------------------
-const defaultAllowed = [
+// =======================
+// 1) LISTA BLANCA ORIGINS
+// =======================
+const defaultAllowed = new Set([
   "https://automatizacionesbilbao.es",
   "https://www.automatizacionesbilbao.es",
-];
+]);
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+const allowedFromEnv = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const finalAllowed = allowedOrigins.length ? allowedOrigins : defaultAllowed;
+const allowedOrigins = new Set(
+  allowedFromEnv.length ? allowedFromEnv : Array.from(defaultAllowed)
+);
 
+// Helper: ¿origin permitido?
+function isAllowedOrigin(origin) {
+  return origin && allowedOrigins.has(origin);
+}
+
+// ==================================
+// 2) CORS SOLO PARA /api/* (recomendado)
+// ==================================
 app.use(
+  "/api",
   cors({
-    origin: function (origin, cb) {
-      // Permite llamadas sin Origin (Postman/cURL). Si quieres bloquearlas, cambia a: return cb(new Error("CORS: origen requerido"));
-      if (!origin) return cb(null, true);
+    origin: (origin, cb) => {
+      // Bloquea peticiones SIN origin para API (evita curl/postman/bots)
+      if (!origin) return cb(new Error("CORS: missing origin"), false);
 
-      if (finalAllowed.includes(origin)) return cb(null, true);
+      if (isAllowedOrigin(origin)) return cb(null, true);
 
-      return cb(new Error("CORS: origen no permitido"));
+      return cb(new Error("CORS: origin not allowed"), false);
     },
-    methods: ["GET", "POST", "OPTIONS"],
+    methods: ["POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "X-Widget-Token"],
-    // credentials: false, // no usamos cookies aquí
+    credentials: false,
   })
 );
 
-// ✅ Express 5: NO usar app.options("*") ni app.options("/*") (rompe con path-to-regexp)
-// Respuesta genérica a preflight:
-app.use((req, res, next) => {
+// Preflight OPTIONS para /api/*
+app.use("/api", (req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// -------------------- Rate limiting (protege contra abusos y gasto) --------------------
+// =======================
+// 3) RATE LIMIT
+// =======================
 const chatLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minuto
-  max: 20, // 20 req/min por IP
+  windowMs: 60 * 1000,
+  max: 20,
   standardHeaders: true,
   legacyHeaders: false,
 });
 app.use("/api/chat", chatLimiter);
 
-// -------------------- Cliente OpenAI --------------------
+// =======================
+// 4) OpenAI client
+// =======================
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Memoria simple en RAM (MVP). Si reinicia el servicio, se pierde (normal).
-const sessions = new Map(); // sessionId -> [{role, content}, ...]
+// Sesiones en RAM
+const sessions = new Map();
 
-// -------------------- Prompt del sistema --------------------
+// =======================
+// 5) Prompt del sistema
+// =======================
 function systemPrompt() {
   return `
 Eres el asistente de la web de Clickmesh (automatización y soluciones digitales).
@@ -96,25 +106,27 @@ Estilo:
 
 Reglas:
 - No inventes precios, plazos, resultados garantizados ni tecnologías no confirmadas.
-- Si el usuario pide presupuesto o muestra intención de contratar, debes pedir:
-  (1) Nombre, (2) Empresa, (3) Email, (4) Teléfono, (5) Qué proceso quiere automatizar, (6) Herramientas que usa (si lo sabe).
+- Si el usuario pide presupuesto o muestra intención de contratar, pide:
+  (1) Nombre, (2) Empresa, (3) Email, (4) Teléfono, (5) Proceso a automatizar, (6) Herramientas que usa (si lo sabe).
 - Si el usuario quiere hablar con una persona, ofrece contacto y sugiere agendar.
 - Si la consulta es poco concreta, guía con 2-3 preguntas cerradas.
-- Si hay dudas sobre datos, LOPDGDD o RGPD, responde de forma general y sugiere consulta profesional.
+- Si hay dudas sobre LOPDGDD o RGPD, responde de forma general y sugiere consulta profesional.
 
 Importante:
 - Si el usuario aporta datos personales, trátalos con discreción y no los repitas innecesariamente.
 `;
 }
 
-// -------------------- Health check --------------------
+// =======================
+// 6) Health check
+// =======================
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
-// -------------------- Auth simple por token del widget --------------------
+// =======================
+// 7) Middleware token widget
+// =======================
 function requireWidgetToken(req, res, next) {
   const expected = process.env.WIDGET_TOKEN;
-
-  // Si no has configurado WIDGET_TOKEN, mejor fallar explícitamente
   if (!expected) {
     return res
       .status(500)
@@ -125,13 +137,20 @@ function requireWidgetToken(req, res, next) {
   if (!provided || provided !== expected) {
     return res.status(401).json({ reply: "No autorizado." });
   }
-
   next();
 }
 
-// -------------------- Endpoint chat --------------------
+// =======================
+// 8) Endpoint chat
+// =======================
 app.post("/api/chat", requireWidgetToken, async (req, res) => {
   try {
+    // Extra hardening: valida origin también aquí (doble capa)
+    const origin = req.headers.origin;
+    if (!isAllowedOrigin(origin)) {
+      return res.status(403).json({ reply: "Origen no permitido." });
+    }
+
     const { message, sessionId } = req.body || {};
 
     if (!process.env.OPENAI_API_KEY) {
@@ -147,7 +166,6 @@ app.post("/api/chat", requireWidgetToken, async (req, res) => {
         .json({ reply: "Escribe un mensaje para poder ayudarte." });
     }
 
-    // Limita longitud para evitar prompts gigantes
     if (text.length > 2000) {
       return res.status(400).json({
         reply: "El mensaje es demasiado largo. Resúmelo un poco, por favor.",
@@ -156,8 +174,6 @@ app.post("/api/chat", requireWidgetToken, async (req, res) => {
 
     const sid = sessionId || uuidv4();
     const history = sessions.get(sid) || [];
-
-    // Recortamos historial para no crecer sin control
     const trimmedHistory = history.slice(-12);
 
     const messages = [
@@ -176,7 +192,6 @@ app.post("/api/chat", requireWidgetToken, async (req, res) => {
       completion.choices?.[0]?.message?.content?.trim() ||
       "No he podido responder ahora mismo.";
 
-    // Guardar conversación en sesión
     sessions.set(sid, [
       ...trimmedHistory,
       { role: "user", content: text },
@@ -192,14 +207,16 @@ app.post("/api/chat", requireWidgetToken, async (req, res) => {
   }
 });
 
-// -------------------- Manejo de errores CORS (más claro) --------------------
+// =======================
+// 9) Errores CORS claros
+// =======================
 app.use((err, req, res, next) => {
-  if (String(err?.message || "").includes("CORS")) {
+  const msg = String(err?.message || "");
+  if (msg.startsWith("CORS:")) {
     return res.status(403).json({ reply: "Origen no permitido." });
   }
   next(err);
 });
 
-// -------------------- Arranque --------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API escuchando en http://localhost:${PORT}`));
